@@ -18,6 +18,7 @@
     <ClInclude Include="GameVersion.h" />
     <ClInclude Include="Logger.h" />
     <ClInclude Include="ParallelRenderCull.h" />
+    <ClInclude Include="SimSlice.h" />
     <ClInclude Include="SimTickBudget.h" />
     <ClInclude Include="resource.h" />
     <ClInclude Include="version.h" />
@@ -30,6 +31,7 @@
     <ClCompile Include="GameVersion.cpp" />
     <ClCompile Include="Logger.cpp" />
     <ClCompile Include="ParallelRenderCull.cpp" />
+    <ClCompile Include="SimSlice.cpp" />
     <ClCompile Include="SimTickBudget.cpp" />
   </ItemGroup>
   <ItemGroup>
