@@ -30,6 +30,9 @@
     <ClInclude Include="ParallelRenderCull.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="SimSlice.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="SimTickBudget.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -60,6 +63,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="ParallelRenderCull.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="SimSlice.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="SimTickBudget.cpp">

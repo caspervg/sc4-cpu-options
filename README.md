@@ -17,6 +17,13 @@ to 7 workers on the other cores (it needs at least 2 free logical processors bes
 and drawing stay on the game's render thread, unchanged.
 * **Simulation tick budget**: the simulation may take at most 32 ms before the game draws the next frame,
 instead of up to 66 ms, so scrolling and the interface stay smooth in a busy city.
+* **Simulation early exit**: the game gives the simulation a fixed part of every frame (33, 50 or 66 ms by speed),
+even when its work is done, which limits the frame rate to 30, 20 or 15 fps. The rest of that time goes to
+background tasks (growth planning, the demand census, data maps) that mostly have nothing left to do. The plugin
+ends that part once the simulation has caught up and the background tasks have had a turn, so the frame rate is
+limited only by the real work. Sim days pass at the same rate as before. A simulation that cannot keep up gets its
+full time, as in the unmodified game. While the game is paused, the background tasks get one turn plus the
+`-SimEarlyExit` time each frame instead of the rest of a 33 ms frame; their monthly work only finishes a little later.
 
 The last four come from the [SCD3D11](https://github.com/caspervg/scd3d11) graphics driver. The parallel render
 cull and the simulation tick budget patch the game's code and require SimCity 4 version 1.1.641; on other versions
@@ -29,7 +36,17 @@ For troubleshooting, these command line arguments turn parts off:
 | `-ParallelCull:off` | No parallel render cull. |
 | `-SimTickCap:off` | The game's own simulation budget of 33 to 66 ms. |
 | `-SimTickCap:<ms>` | Another budget, 15 to 500 ms. |
+| `-SimEarlyExit:off` | The game's own fixed simulation time per frame. |
+| `-SimEarlyExit:<ms>` | After the simulation has caught up, its background (idle-time) work keeps running for at least this much longer before the frame ends, 0 to 100 ms. Default 2. Also applies while paused. |
+| `-SimFrameCap:<fps>` | Limit the frame rate to this, 10 to 1000 fps. The game sleeps for what is left of a fast frame, and wakes early when a sim day starts. Default off. |
+| `-SimSliceProbe` | Log frame rate, sim days per second and simulation timing every 5 seconds. |
 | `-CPUCount:<n>` | The game's own option: the game picks its cores, the plugin does not restrict its threads, and the parallel render cull's workers share the same cores. When the game is left with one core, the cull stays off. |
+
+On a slower PC or graphics card, or to keep a laptop cooler, cap the frame rate with `-SimFrameCap:60` (or `30`).
+The game then sleeps for the time a frame does not need, so both the CPU and the graphics card do less work. Sim days
+pass at the same rate, because the sleep ends when a sim day is due. With vertical sync on, the frame rate is already
+capped at the screen's refresh rate. If a busy city's buildings seem to grow more slowly, raise `-SimEarlyExit` (for
+example to 10).
 
 If SCD3D11 is also installed, the plugin loaded second finds the game's code already patched and leaves it alone,
 so the patches are applied once.

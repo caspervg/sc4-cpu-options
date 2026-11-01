@@ -22,6 +22,7 @@
 #include "CpuScheduling.h"
 #include "Logger.h"
 #include "ParallelRenderCull.h"
+#include "SimSlice.h"
 #include "SimTickBudget.h"
 #include "version.h"
 #include "cIGZCmdLine.h"
@@ -388,6 +389,22 @@ public:
 		}
 		SimTickBudget::Install(simTickCap);
 
+		// -SimEarlyExit:<milliseconds|off> sets how long idle-time agents keep running, at
+		// least, after the simulator has caught up, before the slice ends early. -SimFrameCap:<fps|off> sleeps
+		// away what is left of a short frame, waking for sim days that fall due. -SimSliceProbe
+		// logs slice, fps and sim-day statistics, for diagnostics.
+		SimSlice::Options sliceOptions;
+		if (pCmdLine->IsSwitchPresent(cRZBaseString("SimEarlyExit"), value, true))
+		{
+			sliceOptions.earlyExitMs = SimSlice::ParseEarlyExit(value.ToChar());
+		}
+		if (pCmdLine->IsSwitchPresent(cRZBaseString("SimFrameCap"), value, true))
+		{
+			sliceOptions.frameCapFps = SimSlice::ParseFrameCap(value.ToChar());
+		}
+		sliceOptions.probe = pCmdLine->IsSwitchPresent(cRZBaseString("SimSliceProbe"));
+		SimSlice::Install(sliceOptions);
+
 		// For PreAppShutdown, which takes the patches out again.
 		pFramework->AddHook(this);
 
@@ -397,6 +414,7 @@ public:
 	bool PreAppShutdown()
 	{
 		ParallelRenderCull::Uninstall();
+		SimSlice::Uninstall();
 		SimTickBudget::Uninstall();
 		return true;
 	}
