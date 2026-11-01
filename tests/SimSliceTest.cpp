@@ -31,17 +31,6 @@ int main()
 	assert(ParseEarlyExit("OFF") < 0);
 	assert(ParseEarlyExit("false") < 0);
 
-	// -SimDayWait: auto (a bare switch), off, or milliseconds 0..100. Not given at all: off.
-	assert(ParseDayWait(nullptr) == kDayWaitAuto);   // a bare -SimDayWait
-	assert(ParseDayWait("auto") == kDayWaitAuto);
-	assert(ParseDayWait("Auto") == kDayWaitAuto);
-	assert(ParseDayWait("junk") == kDayWaitAuto);
-	assert(ParseDayWait("off") == kDayWaitOff);
-	assert(ParseDayWait("-1") == kDayWaitOff);
-	assert(ParseDayWait("0") == 0);
-	assert(ParseDayWait("8") == 8);
-	assert(ParseDayWait("1000") == 100);
-
 	// -SimFrameCap: off/0 for uncapped, else fps clamped to 10..1000.
 	assert(ParseFrameCap(nullptr) == 0);
 	assert(ParseFrameCap("off") == 0);
@@ -52,10 +41,9 @@ int main()
 	assert(ParseFrameCap("5") == 10);
 	assert(ParseFrameCap("5000") == 1000);
 
-	// Defaults: early exit on with a 2 ms allowance, no day wait, no frame cap, no probe.
+	// Defaults: early exit on with a 2 ms allowance, no frame cap, no probe.
 	Options const defaults;
 	assert(defaults.earlyExitMs == 2);
-	assert(defaults.dayWaitMs == kDayWaitOff);
 	assert(defaults.frameCapFps == 0);
 	assert(!defaults.probe);
 

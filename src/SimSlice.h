@@ -16,10 +16,6 @@ namespace SimSlice
 	// The idle-time allowance used when the command line does not set one.
 	constexpr int kDefaultEarlyExitMs = 2;
 
-	// Day-wait settings: a fixed lookahead in milliseconds, or one of these.
-	constexpr int kDayWaitOff = -1;
-	constexpr int kDayWaitAuto = -2;
-
 	struct Options
 	{
 		// Milliseconds of idle-time agent work to allow after the simulator has
@@ -27,17 +23,11 @@ namespace SimSlice
 		// exit off (stock behavior).
 		int earlyExitMs = kDefaultEarlyExitMs;
 
-		// Stay in the slice when the next sim day is due within this many
-		// milliseconds, so leaving early does not make days start late.
-		// kDayWaitAuto uses the measured time between slices. Off by default:
-		// at cheetah the stock game already loses days to month-end and season
-		// work (measured 17.6 days/s against a 20 target), the early exit alone
-		// keeps that rate (18.0), and waiting cost a third of the frames for 0.2
-		// more days/s.
-		int dayWaitMs = kDayWaitOff;
-
-		// Frames shorter than 1000/frameCapFps ms keep running idle-time agents
-		// instead of leaving the slice. 0 leaves the frame rate uncapped.
+		// Frames shorter than 1000/frameCapFps ms sleep the rest of the frame
+		// once the simulator has caught up, on a high-resolution waitable timer.
+		// The sleep ends early for a sim day that falls due, so the cap does not
+		// make days start late. 0 leaves the frame rate uncapped. Needs the
+		// early exit.
 		int frameCapFps = 0;
 
 		// Log slice, fps and sim-day statistics every 5 seconds.
@@ -47,10 +37,6 @@ namespace SimSlice
 	// Parses an -SimEarlyExit value: "off" (or "no", "false"), or milliseconds
 	// (0 to 100). An empty or unreadable value keeps the default.
 	int ParseEarlyExit(const char* value);
-
-	// Parses an -SimDayWait value: "auto", "off", or milliseconds (0 to 100).
-	// A bare -SimDayWait means auto.
-	int ParseDayWait(const char* value);
 
 	// Parses an -SimFrameCap value: "off" or 0 for uncapped, else frames per
 	// second (10 to 1000).

@@ -24,7 +24,17 @@
 // Two patches, both 5-byte jumps to naked stubs:
 //   0x00703F18  8D 9E 90 01 00 00     lea ebx, [esi+0x190]            loop entry -> OnTickBegin
 //   0x00703F53  8B CB E8 3E C2 18 00  mov ecx, ebx; call Elapsed       loop tail  -> OnPass
-// The tail stub leaves the loop at 0x00703F5F when OnPass says so.
+// The tail stub leaves the loop at 0x00703F5F when OnPass says so, or zeroes the
+// elapsed time in EAX to force one more pass past the budget (EAX is reloaded at
+// the loop top, 0x00703F25).
+//
+// Frame cap: once caught up, the tail sleeps until the frame's end, less the
+// measured time outside the slice, on a high-resolution waitable timer (a
+// normal one plus timeBeginPeriod(1) before Windows 10 1803). A sim day that
+// falls due first ends the sleep, and a forced pass starts it at once: the
+// day timer restarts at each step, so a late day would be lost for good. Loop
+// entry tops the sleep up to the full frame, which also caps frames whose
+// slice ends at the hidden pause (scrolling) without reaching the tail.
 //
 // Simulator fields, relative to OnTick's ESI (the agent methods see ESI-8):
 //   +0x028  int   paused count            +0x034  int  speed index (0..2)
@@ -54,6 +64,13 @@
 #include <cstring>
 
 #include <Windows.h>
+#include <mmsystem.h>
+
+#pragma comment(lib, "winmm.lib")
+
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
 
 namespace SimSlice
 {
@@ -78,17 +95,23 @@ namespace SimSlice
 		constexpr size_t kTierCount = 10;
 		constexpr size_t kStepFlagCount = 8;
 		constexpr int kMaxEarlyExitMs = 100;
-		constexpr int kMaxDayWaitMs = 100;
 		constexpr int kMinFrameCapFps = 10;
 		constexpr int kMaxFrameCapFps = 1000;
 		constexpr DWORD kWindowMs = 5000;
 
-		// The auto day-wait lookahead: the smoothed time between slices, plus a
-		// margin, ignoring gaps from pauses and loading.
+		// The time between slices, smoothed, ignoring gaps from pauses and loading.
 		constexpr double kOutsideSmoothing = 0.2;
 		constexpr double kMaxOutsideSampleMs = 250.0;
-		constexpr double kAutoMarginMs = 1.0;
-		constexpr double kMaxAutoLookaheadMs = 50.0;
+
+		// The timer wakes this early and the rest is spun, to hide its jitter.
+		constexpr double kSpinMarginHighResMs = 0.5;
+		constexpr double kSpinMarginLegacyMs = 1.0;
+
+		// OnPass results, read by the tail stub (which repeats the values as literals).
+		constexpr int kContinue = 0;      // the loop's own budget check decides
+		constexpr int kLeave = 1;         // leave the slice now
+		constexpr int kAnotherPass = 2;   // run one more pass, even past the budget
+		static_assert(kLeave == 1 && kAnotherPass == 2, "TailStub compares against these literals");
 
 		uintptr_t gEntryRejoin = 0;
 		uintptr_t gTailRejoin = 0;
@@ -99,7 +122,6 @@ namespace SimSlice
 		GetElapsedFn gGetElapsedFn = nullptr;
 
 		Options gOptions;
-		double gMinFrameMs = 0.0;   // from frameCapFps; 0 when uncapped
 
 		// Time between slices, measured with the performance counter.
 		double gQpcMsPerTick = 0.0;
@@ -107,11 +129,68 @@ namespace SimSlice
 		double gOutsideMs = 0.0;    // smoothed
 		bool gHaveOutside = false;
 
+		// Frame cap.
+		int64_t gMinFrameTicks = 0;   // QPC ticks per capped frame; 0 when uncapped
+		int64_t gTickBeginQpc = 0;    // when the current slice began
+		HANDLE gTimer = nullptr;
+		bool gTimerHighRes = false;
+		bool gTimePeriodRaised = false;
+		double gSpinMarginMs = 0.0;
+
 		int64_t QpcNow()
 		{
 			LARGE_INTEGER now;
 			QueryPerformanceCounter(&now);
 			return now.QuadPart;
+		}
+
+		bool CreateFrameTimer()
+		{
+			gTimer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+			if (gTimer != nullptr)
+			{
+				gTimerHighRes = true;
+				gSpinMarginMs = kSpinMarginHighResMs;
+				return true;
+			}
+			// Before Windows 10 1803: a normal timer, at the 1 ms timer resolution.
+			gTimePeriodRaised = timeBeginPeriod(1) == TIMERR_NOERROR;
+			gTimer = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+			gSpinMarginMs = kSpinMarginLegacyMs;
+			return gTimer != nullptr;
+		}
+
+		void DestroyFrameTimer()
+		{
+			if (gTimer != nullptr) CloseHandle(gTimer);
+			gTimer = nullptr;
+			if (gTimePeriodRaised) timeEndPeriod(1);
+			gTimePeriodRaised = false;
+			gTimerHighRes = false;
+		}
+
+		// Sleeps until the performance counter reaches target. Returns the ms slept.
+		double SleepUntil(int64_t target)
+		{
+			int64_t const start = QpcNow();
+			if (target <= start) return 0.0;
+			double const waitMs = static_cast<double>(target - start) * gQpcMsPerTick - gSpinMarginMs;
+			if (waitMs >= 0.1)
+			{
+				bool waited = false;
+				if (gTimer != nullptr)
+				{
+					LARGE_INTEGER due;
+					due.QuadPart = -static_cast<LONGLONG>(waitMs * 10000.0);   // relative, 100 ns units
+					if (SetWaitableTimer(gTimer, &due, 0, nullptr, nullptr, FALSE))
+					{
+						waited = WaitForSingleObject(gTimer, INFINITE) == WAIT_OBJECT_0;
+					}
+				}
+				if (!waited && waitMs >= 1.0) Sleep(static_cast<DWORD>(waitMs));
+			}
+			while (QpcNow() < target) YieldProcessor();
+			return static_cast<double>(QpcNow() - start) * gQpcMsPerTick;
 		}
 
 		struct Patch
@@ -151,8 +230,9 @@ namespace SimSlice
 			uint32_t emptyMs = 0;                 // time in passes that began and ended caught up
 			bool prevCaughtUp = false;
 			bool exitedEarly = false;
-			bool heldForDay = false;
-			bool heldForFrameCap = false;
+			bool sleptForFrameCap = false;
+			double sleptMs = 0.0;
+			uint32_t dayWakes = 0;
 		};
 
 		TickState gTick;
@@ -168,8 +248,9 @@ namespace SimSlice
 			uint64_t empty = 0;
 			uint32_t ticksWithEmpty = 0;
 			uint32_t earlyExits = 0;
-			uint32_t dayHolds = 0;
-			uint32_t frameCapHolds = 0;
+			uint32_t frameCapSleeps = 0;
+			double sleptMs = 0.0;
+			uint32_t dayWakes = 0;
 
 			uint32_t pausedTicks = 0;
 			uint64_t pausedSlice = 0;
@@ -187,6 +268,9 @@ namespace SimSlice
 		{
 			if (!gTick.active) return;
 			gWindow.allTicks++;
+			gWindow.sleptMs += gTick.sleptMs;
+			gWindow.dayWakes += gTick.dayWakes;
+			if (gTick.sleptForFrameCap) gWindow.frameCapSleeps++;
 			if (gTick.passes > 0)
 			{
 				if (gTick.paused)
@@ -204,8 +288,6 @@ namespace SimSlice
 					if (gTick.emptyMs > 0) gWindow.ticksWithEmpty++;
 				}
 				if (gTick.exitedEarly) gWindow.earlyExits++;
-				if (gTick.heldForDay) gWindow.dayHolds++;
-				if (gTick.heldForFrameCap) gWindow.frameCapHolds++;
 			}
 			gTick = TickState{};
 		}
@@ -319,9 +401,9 @@ namespace SimSlice
 			double const seconds = elapsedMs / 1000.0;
 
 			logger.WriteLineFormatted(LogLevel::Info,
-				"sim slice: fps=%.1f simDays/s=%.2f speed=%s%s earlyExits=%u dayHolds=%u frameCapHolds=%u outside=%.1f ms",
+				"sim slice: fps=%.1f simDays/s=%.2f speed=%s%s earlyExits=%u frameCapSleeps=%u slept=%.1f ms/frame dayWakes=%u outside=%.1f ms",
 				w.allTicks / seconds, w.simDays / seconds, SpeedName(w.speed), w.mixedSpeed ? "(mixed)" : "",
-				w.earlyExits, w.dayHolds, w.frameCapHolds, gOutsideMs);
+				w.earlyExits, w.frameCapSleeps, w.allTicks > 0 ? w.sleptMs / w.allTicks : 0.0, w.dayWakes, gOutsideMs);
 			if (w.ticks > 0)
 			{
 				double const t = static_cast<double>(w.ticks);
@@ -369,19 +451,26 @@ namespace SimSlice
 			gHaveOutside = true;
 		}
 
-		// Smoothed only: single long frames (season changes, month ends) would
-		// otherwise stretch the lookahead and hold the slice for nothing.
-		double AutoLookaheadMs()
-		{
-			if (!gHaveOutside) return kMaxAutoLookaheadMs;   // no estimate yet: behave like stock
-			double const lookahead = gOutsideMs + kAutoMarginMs;
-			return lookahead > kMaxAutoLookaheadMs ? kMaxAutoLookaheadMs : lookahead;
-		}
-
 		void __stdcall OnTickBegin(const uint8_t* sim)
 		{
 			FinishTick();
 			MeasureOutside();
+			if (gMinFrameTicks > 0)
+			{
+				// Top up to the full frame: the tail's sleep only estimates the time
+				// outside the slice, and slices cut short by the hidden pause never
+				// reach the tail.
+				if (gTickBeginQpc != 0)
+				{
+					double const slept = SleepUntil(gTickBeginQpc + gMinFrameTicks);
+					if (slept > 0.0)
+					{
+						gTick.sleptMs += slept;
+						gTick.sleptForFrameCap = true;
+					}
+				}
+				gTickBeginQpc = QpcNow();
+			}
 			if (gOptions.probe)
 			{
 				DWORD const now = GetTickCount();
@@ -414,10 +503,50 @@ namespace SimSlice
 			return true;
 		}
 
-		// Returns true to leave the slice now.
-		bool __stdcall OnPass(const uint8_t* sim, uint32_t elapsed)
+		// The frame cap, once caught up: sleep until the frame's end, less the
+		// expected time outside the slice, or until the next sim day if that is
+		// sooner. The day timer restarts at each step, so a day that starts late
+		// loses that time for good; a forced pass starts it at once instead.
+		int SleepRestOfFrame(const uint8_t* sim)
 		{
-			if (!gTick.active) return false;
+			int64_t const outside = gHaveOutside ? static_cast<int64_t>(gOutsideMs / gQpcMsPerTick) : 0;
+			int64_t const frameEnd = gTickBeginQpc + gMinFrameTicks - outside;
+			int64_t const now = QpcNow();
+			if (now >= frameEnd) return kLeave;
+
+			int64_t wake = frameEnd;
+			bool forDay = false;
+			if (!gTick.paused)
+			{
+				uint32_t const interval = Read<uint32_t>(sim, 0x78);
+				uint32_t const sinceStep = gGetElapsedFn(sim + 0x40);
+				if (sinceStep >= interval)
+				{
+					gTick.dayWakes++;
+					return kAnotherPass;   // already due
+				}
+				int64_t const due = now + static_cast<int64_t>((interval - sinceStep) / gQpcMsPerTick);
+				if (due < frameEnd)
+				{
+					wake = due;
+					forDay = true;
+				}
+			}
+
+			gTick.sleptMs += SleepUntil(wake);
+			gTick.sleptForFrameCap = true;
+			if (forDay)
+			{
+				gTick.dayWakes++;
+				return kAnotherPass;
+			}
+			return kLeave;
+		}
+
+		// Returns kContinue, kLeave or kAnotherPass.
+		int __stdcall OnPass(const uint8_t* sim, uint32_t elapsed)
+		{
+			if (!gTick.active) return kContinue;
 			gLastPassQpc = QpcNow();   // the last pass of a slice marks where the slice ended
 
 			if (!gTick.paused && sim[0xD8] != 0) gWindow.simDays++;
@@ -432,42 +561,21 @@ namespace SimSlice
 			if (!caughtUp)
 			{
 				gTick.caughtUpAt = kNotCaughtUp;
-				return false;
+				return kContinue;
 			}
 			if (gTick.caughtUpAt == kNotCaughtUp) gTick.caughtUpAt = elapsed;
-			if (gOptions.earlyExitMs < 0) return false;
-			if (elapsed - gTick.caughtUpAt < static_cast<uint32_t>(gOptions.earlyExitMs)) return false;
+			if (gOptions.earlyExitMs < 0) return kContinue;
+			if (elapsed - gTick.caughtUpAt < static_cast<uint32_t>(gOptions.earlyExitMs)) return kContinue;
 
-			// Frame cap: a frame this short keeps feeding idle-time agents instead.
-			if (gMinFrameMs > 0.0)
+			if (gMinFrameTicks > 0)
 			{
-				double const outside = gHaveOutside ? gOutsideMs : 0.0;
-				if (outside + elapsed < gMinFrameMs)
-				{
-					gTick.heldForFrameCap = true;
-					return false;
-				}
-			}
-
-			// Day wait: the clock only steps inside a slice, and the step timer
-			// restarts at the step, so a day that falls due between slices would
-			// start late and that time would be lost for good. Stay for it.
-			if (!gTick.paused && gOptions.dayWaitMs != kDayWaitOff)
-			{
-				double const lookahead = gOptions.dayWaitMs == kDayWaitAuto
-					? AutoLookaheadMs() : static_cast<double>(gOptions.dayWaitMs);
-				uint32_t const interval = Read<uint32_t>(sim, 0x78);
-				uint32_t const sinceStep = gGetElapsedFn(sim + 0x40);
-				uint32_t const dueIn = sinceStep >= interval ? 0 : interval - sinceStep;
-				if (static_cast<double>(dueIn) <= lookahead)
-				{
-					gTick.heldForDay = true;
-					return false;
-				}
+				int const result = SleepRestOfFrame(sim);
+				gLastPassQpc = QpcNow();   // the sleep is not time outside the slice
+				if (result == kAnotherPass) return kAnotherPass;
 			}
 
 			gTick.exitedEarly = true;
-			return true;
+			return kLeave;
 		}
 
 		// Loop entry: displaced lea ebx, [esi+0x190].
@@ -488,7 +596,8 @@ namespace SimSlice
 		}
 
 		// Loop tail: displaced mov ecx, ebx; call cRZTimer::GetElapsedTime.
-		// EAX (elapsed) must survive to the cmp at the rejoin; ECX/EDX are dead.
+		// EAX (elapsed) must survive to the cmp at the rejoin, except that 0 forces
+		// another pass; ECX/EDX are dead.
 		__declspec(naked) void TailStub()
 		{
 			__asm {
@@ -498,9 +607,14 @@ namespace SimSlice
 				push eax
 				push esi
 				call OnPass
-				test al, al
+				mov  ecx, eax
 				pop  eax
-				jnz  leave_slice
+				cmp  ecx, 1            // kLeave
+				je   leave_slice
+				cmp  ecx, 2            // kAnotherPass
+				jne  rejoin
+				xor  eax, eax
+			rejoin:
 				jmp  dword ptr [gTailRejoin]
 			leave_slice:
 				jmp  dword ptr [gLoopExit]
@@ -568,16 +682,6 @@ namespace SimSlice
 		return ms > kMaxEarlyExitMs ? kMaxEarlyExitMs : static_cast<int>(ms);
 	}
 
-	int ParseDayWait(const char* value)
-	{
-		if (value == nullptr || *value == '\0' || _stricmp(value, "auto") == 0) return kDayWaitAuto;
-		if (IsOff(value)) return kDayWaitOff;
-		long ms = 0;
-		if (!ParseNumber(value, ms)) return kDayWaitAuto;
-		if (ms < 0) return kDayWaitOff;
-		return ms > kMaxDayWaitMs ? kMaxDayWaitMs : static_cast<int>(ms);
-	}
-
 	int ParseFrameCap(const char* value)
 	{
 		if (value == nullptr || *value == '\0' || IsOff(value)) return 0;
@@ -611,20 +715,34 @@ namespace SimSlice
 		gGetElapsed = reinterpret_cast<uintptr_t>(module + (kGetElapsedVA - kImageBase));
 		gGetElapsedFn = reinterpret_cast<GetElapsedFn>(gGetElapsed);
 		gOptions = options;
-		gMinFrameMs = options.frameCapFps > 0 ? 1000.0 / options.frameCapFps : 0.0;
 
 		LARGE_INTEGER frequency;
 		if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0) return false;
 		gQpcMsPerTick = 1000.0 / static_cast<double>(frequency.QuadPart);
 
+		// The frame cap sleeps only after an early exit decision.
+		bool const frameCap = options.frameCapFps > 0 && options.earlyExitMs >= 0;
+		if (frameCap)
+		{
+			if (!CreateFrameTimer())
+			{
+				logger.WriteLine(LogLevel::Info, "sim frame cap: no waitable timer, sleeping with Sleep()");
+			}
+			gMinFrameTicks = frequency.QuadPart / options.frameCapFps;
+		}
+
 		if (!WriteJump(gTailPatch, module + (kTailVA - kImageBase), kTailLen, kTailExpected, &TailStub))
 		{
+			DestroyFrameTimer();
+			gMinFrameTicks = 0;
 			logger.WriteLine(LogLevel::Info, "sim early exit: cSC4Simulator::OnTick loop tail already modified, skipping");
 			return false;
 		}
 		if (!WriteJump(gEntryPatch, module + (kEntryVA - kImageBase), kEntryLen, kEntryExpected, &EntryStub))
 		{
 			Restore(gTailPatch);
+			DestroyFrameTimer();
+			gMinFrameTicks = 0;
 			logger.WriteLine(LogLevel::Info, "sim early exit: cSC4Simulator::OnTick loop entry already modified, skipping");
 			return false;
 		}
@@ -632,16 +750,19 @@ namespace SimSlice
 		gInstalled = true;
 		if (options.earlyExitMs >= 0)
 		{
-			char dayWait[32];
-			if (options.dayWaitMs == kDayWaitAuto) std::snprintf(dayWait, sizeof(dayWait), "auto");
-			else if (options.dayWaitMs == kDayWaitOff) std::snprintf(dayWait, sizeof(dayWait), "off");
-			else std::snprintf(dayWait, sizeof(dayWait), "%d ms", options.dayWaitMs);
-			char frameCap[32];
-			if (options.frameCapFps > 0) std::snprintf(frameCap, sizeof(frameCap), "%d fps", options.frameCapFps);
-			else std::snprintf(frameCap, sizeof(frameCap), "off");
+			char frameCapText[64];
+			if (frameCap)
+			{
+				std::snprintf(frameCapText, sizeof(frameCapText), "%d fps (%s timer)", options.frameCapFps,
+					gTimerHighRes ? "high-resolution" : gTimePeriodRaised ? "1 ms resolution" : "default resolution");
+			}
+			else
+			{
+				std::snprintf(frameCapText, sizeof(frameCapText), "off");
+			}
 			logger.WriteLineFormatted(LogLevel::Info,
-				"sim early exit installed: idle allowance=%d ms, day wait=%s, frame cap=%s%s",
-				options.earlyExitMs, dayWait, frameCap, options.probe ? ", probe on" : "");
+				"sim early exit installed: idle allowance=%d ms, frame cap=%s%s",
+				options.earlyExitMs, frameCapText, options.probe ? ", probe on" : "");
 		}
 		else
 		{
@@ -656,6 +777,8 @@ namespace SimSlice
 		// Entry first, so no tick starts against a removed tail.
 		Restore(gEntryPatch);
 		Restore(gTailPatch);
+		gMinFrameTicks = 0;
+		DestroyFrameTimer();
 		gInstalled = false;
 		Logger::GetInstance().WriteLine(LogLevel::Info, "sim early exit uninstalled");
 	}

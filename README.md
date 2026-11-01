@@ -35,17 +35,15 @@ For troubleshooting, these command line arguments turn parts off:
 | `-SimTickCap:<ms>` | Another budget, 15 to 500 ms. |
 | `-SimEarlyExit:off` | The game's own fixed simulation time per frame. |
 | `-SimEarlyExit:<ms>` | After the simulation has caught up, its background (idle-time) work may run this much longer before the frame ends, 0 to 100 ms. Default 2. |
-| `-SimDayWait` | Before ending the simulation's part of a frame early, wait for a sim day that is due before the next frame. Cheetah may then reach a few more sim days per second, at a lower frame rate. Default off. |
-| `-SimDayWait:<ms>` | The same, for a sim day due within this many ms, 0 to 100, instead of the measured time between frames. |
-| `-SimFrameCap:<fps>` | Spend what is left of frames faster than this on the simulation's background work, 10 to 1000 fps. Default off. |
+| `-SimFrameCap:<fps>` | Limit the frame rate to this, 10 to 1000 fps. The game sleeps for what is left of a fast frame, and wakes early when a sim day starts. Default off. |
 | `-SimSliceProbe` | Log frame rate, sim days per second and simulation timing every 5 seconds. |
 | `-CPUCount:<n>` | The game's own option: the game picks its cores, the plugin does not restrict its threads, and the parallel render cull's workers share the same cores. When the game is left with one core, the cull stays off. |
 
 On a slower PC or graphics card, or to keep a laptop cooler, cap the frame rate with `-SimFrameCap:60` (or `30`).
-The time a frame does not need then goes to the simulation's background work, as in the unmodified game, and the
-graphics card renders fewer frames. With vertical sync on, the frame rate is already capped at the screen's refresh
-rate. If a busy city's buildings seem to grow more slowly, raise `-SimEarlyExit` (for example to 10), or use
-`-SimFrameCap`.
+The game then sleeps for the time a frame does not need, so both the CPU and the graphics card do less work. Sim days
+pass at the same rate, because the sleep ends when a sim day is due. With vertical sync on, the frame rate is already
+capped at the screen's refresh rate. If a busy city's buildings seem to grow more slowly, raise `-SimEarlyExit` (for
+example to 10).
 
 If SCD3D11 is also installed, the plugin loaded second finds the game's code already patched and leaves it alone,
 so the patches are applied once.

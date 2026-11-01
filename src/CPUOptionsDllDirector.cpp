@@ -390,18 +390,13 @@ public:
 		SimTickBudget::Install(simTickCap);
 
 		// -SimEarlyExit:<milliseconds|off> sets how long idle-time agents may run after the
-		// simulator has caught up, before the slice ends early. -SimDayWait:<auto|milliseconds|off>
-		// keeps the slice going for a sim day that is about to start. -SimFrameCap:<fps|off>
-		// spends what is left of a short frame on idle-time agents. -SimSliceProbe logs slice,
-		// fps and sim-day statistics, for diagnostics.
+		// simulator has caught up, before the slice ends early. -SimFrameCap:<fps|off> sleeps
+		// away what is left of a short frame, waking for sim days that fall due. -SimSliceProbe
+		// logs slice, fps and sim-day statistics, for diagnostics.
 		SimSlice::Options sliceOptions;
 		if (pCmdLine->IsSwitchPresent(cRZBaseString("SimEarlyExit"), value, true))
 		{
 			sliceOptions.earlyExitMs = SimSlice::ParseEarlyExit(value.ToChar());
-		}
-		if (pCmdLine->IsSwitchPresent(cRZBaseString("SimDayWait"), value, true))
-		{
-			sliceOptions.dayWaitMs = SimSlice::ParseDayWait(value.ToChar());
 		}
 		if (pCmdLine->IsSwitchPresent(cRZBaseString("SimFrameCap"), value, true))
 		{
