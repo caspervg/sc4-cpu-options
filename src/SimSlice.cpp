@@ -19,7 +19,25 @@
 // only starts when the previous day's agents are done and the speed's
 // wall-clock interval ("Simulator Speeds" exemplar property 0x89590E6D) has
 // passed. SimulateAgents and SimulateIdleTime share the slice timer, so once
-// the agent tiers are exhausted the rest of the slice is spent on empty passes.
+// the agent tiers are exhausted the rest of the slice is spent on further
+// SimulateIdleTime rounds.
+//
+// SimulateIdleTime sends message 0x6695681A to each enabled idle-time agent in
+// turn, with a time slice of min(budget left, budget / 3) and the paused state
+// (which the handlers read so far ignore), until one full round is done or the
+// budget runs out. In 1.1.641 the idle agents are the growth developers (one per
+// occupant group), building development, demand, land value, aura, crime,
+// commercial, power, plumbing, prop developer, neighbors and residential. Most
+// run a staged cycle started by their monthly simulation (growth planning, the
+// demand census) and return at once when it is done; neighbors only pushes deal
+// changes to the region; residential ignores the message. So after a cycle
+// completes, the extra rounds mostly find nothing to do.
+//
+// The early exit is checked only at the end of a pass, so every slice gives each
+// idle agent at least one turn, and the allowance after catching up is a
+// minimum: the pass that crosses it runs to its end. Paused frames count as
+// caught up at once (the sim clock is stopped, so no new cycles start), and so
+// get one round plus the allowance; the stock game spends the whole slice.
 //
 // Two patches, both 5-byte jumps to naked stubs:
 //   0x00703F18  8D 9E 90 01 00 00     lea ebx, [esi+0x190]            loop entry -> OnTickBegin
@@ -227,7 +245,7 @@ namespace SimSlice
 			uint32_t budget = 0;
 			uint32_t lastElapsed = 0;
 			uint32_t caughtUpAt = kNotCaughtUp;   // slice time the current caught-up run began
-			uint32_t emptyMs = 0;                 // time in passes that began and ended caught up
+			uint32_t idleOnlyMs = 0;              // time in passes that began and ended caught up
 			bool prevCaughtUp = false;
 			bool exitedEarly = false;
 			bool sleptForFrameCap = false;
@@ -245,8 +263,8 @@ namespace SimSlice
 			uint64_t passes = 0;
 			uint64_t budget = 0;
 			uint64_t slice = 0;
-			uint64_t empty = 0;
-			uint32_t ticksWithEmpty = 0;
+			uint64_t idleOnly = 0;
+			uint32_t ticksWithIdleOnly = 0;
 			uint32_t earlyExits = 0;
 			uint32_t frameCapSleeps = 0;
 			double sleptMs = 0.0;
@@ -284,8 +302,8 @@ namespace SimSlice
 					gWindow.passes += gTick.passes;
 					gWindow.budget += gTick.budget;
 					gWindow.slice += gTick.lastElapsed;
-					gWindow.empty += gTick.emptyMs;
-					if (gTick.emptyMs > 0) gWindow.ticksWithEmpty++;
+					gWindow.idleOnly += gTick.idleOnlyMs;
+					if (gTick.idleOnlyMs > 0) gWindow.ticksWithIdleOnly++;
 				}
 				if (gTick.exitedEarly) gWindow.earlyExits++;
 			}
@@ -408,9 +426,9 @@ namespace SimSlice
 			{
 				double const t = static_cast<double>(w.ticks);
 				logger.WriteLineFormatted(LogLevel::Info,
-					"sim slice: running ticks=%u passes/tick=%.1f budget=%.1f ms slice=%.1f ms empty=%.1f ms ticksWithEmpty=%u%%",
-					w.ticks, w.passes / t, w.budget / t, w.slice / t, w.empty / t,
-					static_cast<unsigned>(100.0 * w.ticksWithEmpty / t));
+					"sim slice: running ticks=%u passes/tick=%.1f budget=%.1f ms slice=%.1f ms idleOnly=%.1f ms ticksWithIdleOnly=%u%%",
+					w.ticks, w.passes / t, w.budget / t, w.slice / t, w.idleOnly / t,
+					static_cast<unsigned>(100.0 * w.ticksWithIdleOnly / t));
 			}
 			if (w.pausedTicks > 0)
 			{
@@ -491,7 +509,9 @@ namespace SimSlice
 
 		bool CaughtUp(const uint8_t* sim)
 		{
-			if (gTick.paused) return true;   // only SimulateIdleTime runs
+			// Paused: only SimulateIdleTime runs, and with the clock stopped no new
+			// idle cycles start, so the first round is enough to count as caught up.
+			if (gTick.paused) return true;
 			for (size_t i = 0; i < kStepFlagCount; i++)
 			{
 				if (sim[0xD4 + i] != 0) return false;   // the clock stepped this pass: new work queued
@@ -553,7 +573,7 @@ namespace SimSlice
 
 			bool const caughtUp = CaughtUp(sim);
 			uint32_t const delta = elapsed >= gTick.lastElapsed ? elapsed - gTick.lastElapsed : 0;
-			if (gTick.prevCaughtUp && caughtUp) gTick.emptyMs += delta;
+			if (gTick.prevCaughtUp && caughtUp) gTick.idleOnlyMs += delta;
 			gTick.prevCaughtUp = caughtUp;
 			gTick.lastElapsed = elapsed;
 			gTick.passes++;

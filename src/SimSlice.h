@@ -18,9 +18,10 @@ namespace SimSlice
 
 	struct Options
 	{
-		// Milliseconds of idle-time agent work to allow after the simulator has
-		// caught up, before leaving the slice early. Negative turns the early
-		// exit off (stock behavior).
+		// Minimum milliseconds of idle-time agent work to allow after the
+		// simulator has caught up, before leaving the slice early (checked at
+		// the end of each pass, so the last pass may run past it). Negative
+		// turns the early exit off (stock behavior).
 		int earlyExitMs = kDefaultEarlyExitMs;
 
 		// Frames shorter than 1000/frameCapFps ms sleep the rest of the frame
@@ -45,12 +46,14 @@ namespace SimSlice
 	// cSC4Simulator::OnTick runs the simulation for a fixed slice every frame
 	// (1000 / 30, 20 or 15 ms, by speed), however little work there is. The sim
 	// clock is gated by wall-clock time, so once the agents have caught up the
-	// rest of the slice only spins, which caps the frame rate at 30/20/15 fps.
-	// The early exit leaves the slice once the simulator has caught up and the
-	// idle-time agents have had their allowance, so frames are only as long as
-	// the real work, and sim days per second stay as in the stock game. A
-	// simulator that cannot keep up never catches up, and then the slice runs
-	// exactly as in the stock game.
+	// rest of the slice repeats the idle-time agents, which mostly have nothing
+	// left to do, and the frame rate is capped at 30/20/15 fps. The early exit
+	// leaves the slice once the simulator has caught up and the idle-time
+	// agents have had their allowance, so frames are only as long as the real
+	// work, and sim days per second stay as in the stock game. A simulator that
+	// cannot keep up never catches up, and then the slice runs exactly as in
+	// the stock game. Paused frames count as caught up, so they give the
+	// idle-time agents one round plus the allowance instead of the whole slice.
 	//
 	// Requires SimCity 4 Deluxe 1.1.641. Safe to call twice; only the first
 	// installs. Returns true if a patch is active afterwards.
